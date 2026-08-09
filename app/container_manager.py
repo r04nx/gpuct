@@ -1,0 +1,343 @@
+import subprocess
+import json
+import time
+import logging
+from typing import Dict, List, Optional, Tuple
+import re
+import os
+from datetime import datetime, timedelta
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ContainerManager:
+    def __init__(self):
+        self.containers_db = {}  # Simple in-memory storage for demo
+        self.sudo_prefix = ["sudo"]  # Add sudo prefix to all incus commands
+        
+    def _run_incus_command(self, cmd_args: List[str], **kwargs) -> subprocess.CompletedProcess:
+        """Run incus command with sudo prefix"""
+        full_cmd = self.sudo_prefix + ["incus"] + cmd_args
+        logger.debug(f"Running command: {' '.join(full_cmd)}")
+        return subprocess.run(full_cmd, **kwargs)
+        
+    async def create_container(self, 
+                             username: str,
+                             password: str,
+                             ram: str,
+                             storage: str,
+                             student_email: str,
+                             days_to_live: int) -> Dict:
+        """
+        Create a new Incus container with specified configuration
+        """
+        try:
+            container_name = f"{username}-{int(time.time())}"
+            
+            # Create the container
+            create_args = [
+                "launch", "ubuntu:22.04", container_name,
+                "--config", f"limits.memory={ram}",
+                "--config", f"limits.disk={storage}"
+            ]
+            
+            logger.info(f"Creating container: {container_name}")
+            result = self._run_incus_command(create_args, capture_output=True, text=True, check=True)
+            
+            # Wait for container to start
+            await self._wait_for_container_start(container_name)
+            
+            # Configure the container
+            await self._setup_container(container_name, username, password)
+            
+            # Get container IP
+            container_ip = await self._get_container_ip(container_name)
+            
+            # Generate SSH keys
+            private_key, public_key = await self._generate_ssh_keys(username)
+            
+            # Setup SSH access
+            await self._setup_ssh_access(container_name, username, public_key)
+            
+            # Calculate expiration date
+            expiration_date = datetime.now() + timedelta(days=days_to_live)
+            
+            # Store container info
+            container_info = {
+                "name": container_name,
+                "username": username,
+                "ip_address": container_ip,
+                "student_email": student_email,
+                "created_at": datetime.now().isoformat(),
+                "expires_at": expiration_date.isoformat(),
+                "days_to_live": days_to_live,
+                "status": "running"
+            }
+            
+            self.containers_db[container_name] = container_info
+            
+            # Ensure ssh_keys directory exists
+            ssh_keys_dir = "ssh_keys"
+            if not os.path.exists(ssh_keys_dir):
+                os.makedirs(ssh_keys_dir, mode=0o700)
+            
+            # Save private key to file
+            key_filename = f"{ssh_keys_dir}/{username}-{container_name}.pem"
+            with open(key_filename, 'w') as f:
+                f.write(private_key)
+            
+            # Set proper permissions on the key file
+            os.chmod(key_filename, 0o600)
+            
+            container_info["private_key_file"] = key_filename
+            
+            logger.info(f"Container {container_name} created successfully")
+            return container_info
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to create container: {e.stderr}")
+            raise Exception(f"Container creation failed: {e.stderr}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            raise
+    
+    async def _wait_for_container_start(self, container_name: str, timeout: int = 60):
+        """Wait for container to be in running state"""
+        for _ in range(timeout):
+            try:
+                result = self._run_incus_command(
+                    ["info", container_name], 
+                    capture_output=True, text=True, check=True
+                )
+                if "Status: Running" in result.stdout:
+                    time.sleep(5)  # Additional wait for services to start
+                    return
+                time.sleep(1)
+            except subprocess.CalledProcessError:
+                time.sleep(1)
+        raise Exception(f"Container {container_name} failed to start within {timeout} seconds")
+    
+    async def _setup_container(self, container_name: str, username: str, password: str):
+        """Setup the container with user account and SSH server"""
+        commands = [
+            # Update package list
+            "apt-get update",
+            # Install SSH server and other utilities
+            "apt-get install -y openssh-server sudo curl wget",
+            # Create user account
+            f"useradd -m -s /bin/bash {username}",
+            # Set password
+            f"echo '{username}:{password}' | chpasswd",
+            # Add user to sudo group
+            f"usermod -aG sudo {username}",
+            # Configure SSH
+            "systemctl enable ssh",
+            "systemctl start ssh",
+            # Allow password authentication (temporarily)
+            "sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config",
+            "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config",
+            # Restart SSH service
+            "systemctl restart ssh"
+        ]
+        
+        for cmd in commands:
+            try:
+                result = self._run_incus_command(
+                    ["exec", container_name, "--", "bash", "-c", cmd],
+                    capture_output=True, text=True, check=True
+                )
+                logger.debug(f"Command executed: {cmd}")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Command failed: {cmd} - {e.stderr}")
+                # Continue with other commands even if one fails
+    
+    async def _get_container_ip(self, container_name: str, max_attempts: int = 30) -> str:
+        """Get the IP address of the container"""
+        for attempt in range(max_attempts):
+            try:
+                result = self._run_incus_command(
+                    ["info", container_name],
+                    capture_output=True, text=True, check=True
+                )
+                
+                # Parse the output to find IPv4 address
+                lines = result.stdout.split('\n')
+                for line in lines:
+                    if 'inet:' in line or 'inet4:' in line:
+                        # Look for private IP addresses
+                        ip_patterns = [
+                            r'10\.\d+\.\d+\.\d+',
+                            r'172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+',
+                            r'192\.168\.\d+\.\d+'
+                        ]
+                        for pattern in ip_patterns:
+                            ip_match = re.search(pattern, line)
+                            if ip_match:
+                                ip = ip_match.group()
+                                # Verify it's not a loopback address
+                                if not ip.startswith('127.'):
+                                    return ip
+                
+                time.sleep(2)
+                
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to get container info: {e.stderr}")
+                time.sleep(2)
+        
+        # If we can't find a private IP, try to get any available IP
+        try:
+            result = self._run_incus_command(
+                ["list", container_name, "--format", "json"],
+                capture_output=True, text=True, check=True
+            )
+            container_data = json.loads(result.stdout)
+            if container_data and len(container_data) > 0:
+                state = container_data[0].get("state", {})
+                network = state.get("network", {})
+                for interface_name, interface_data in network.items():
+                    if interface_name != "lo":  # Skip loopback
+                        addresses = interface_data.get("addresses", [])
+                        for addr in addresses:
+                            if addr.get("family") == "inet" and addr.get("scope") == "global":
+                                return addr.get("address")
+        except Exception as e:
+            logger.error(f"Failed to get container IP from JSON: {str(e)}")
+        
+        raise Exception(f"Could not get IP address for container {container_name}")
+    
+    async def _generate_ssh_keys(self, username: str) -> Tuple[str, str]:
+        """Generate SSH key pair"""
+        # Generate private key
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        
+        # Get public key
+        public_key = private_key.public_key()
+        
+        # Serialize private key
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode()
+        
+        # Serialize public key in OpenSSH format
+        public_ssh = public_key.public_bytes(
+            encoding=serialization.Encoding.OpenSSH,
+            format=serialization.PublicFormat.OpenSSH
+        ).decode()
+        
+        return private_pem, public_ssh
+    
+    async def _setup_ssh_access(self, container_name: str, username: str, public_key: str):
+        """Setup SSH key-based authentication"""
+        commands = [
+            f"mkdir -p /home/{username}/.ssh",
+            f"echo '{public_key}' >> /home/{username}/.ssh/authorized_keys",
+            f"chown -R {username}:{username} /home/{username}/.ssh",
+            f"chmod 700 /home/{username}/.ssh",
+            f"chmod 600 /home/{username}/.ssh/authorized_keys"
+        ]
+        
+        for cmd in commands:
+            try:
+                self._run_incus_command(
+                    ["exec", container_name, "--", "bash", "-c", cmd],
+                    capture_output=True, text=True, check=True
+                )
+            except subprocess.CalledProcessError as e:
+                logger.error(f"SSH setup command failed: {cmd} - {e.stderr}")
+    
+    async def list_containers(self) -> List[Dict]:
+        """List all managed containers"""
+        try:
+            # Get live container info from incus
+            result = self._run_incus_command(
+                ["list", "--format", "json"],
+                capture_output=True, text=True, check=True
+            )
+            live_containers = json.loads(result.stdout)
+            
+            # Update our database with live status
+            live_container_names = {c["name"] for c in live_containers}
+            
+            # Remove containers from our DB that no longer exist
+            containers_to_remove = []
+            for name in self.containers_db.keys():
+                if name not in live_container_names:
+                    containers_to_remove.append(name)
+            
+            for name in containers_to_remove:
+                del self.containers_db[name]
+                logger.info(f"Removed non-existent container {name} from database")
+            
+            return list(self.containers_db.values())
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to list containers: {e.stderr}")
+            return list(self.containers_db.values())
+    
+    async def get_container(self, container_name: str) -> Optional[Dict]:
+        """Get container information"""
+        return self.containers_db.get(container_name)
+    
+    async def freeze_container(self, container_name: str) -> bool:
+        """Freeze a container"""
+        try:
+            self._run_incus_command(
+                ["freeze", container_name],
+                capture_output=True, text=True, check=True
+            )
+            if container_name in self.containers_db:
+                self.containers_db[container_name]["status"] = "frozen"
+            logger.info(f"Container {container_name} frozen")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to freeze container: {e.stderr}")
+            return False
+    
+    async def delete_container(self, container_name: str) -> bool:
+        """Delete a container"""
+        try:
+            # Stop the container first if running
+            self._run_incus_command(
+                ["stop", container_name],
+                capture_output=True, text=True
+            )
+            
+            # Delete the container
+            self._run_incus_command(
+                ["delete", container_name],
+                capture_output=True, text=True, check=True
+            )
+            
+            # Remove from database
+            if container_name in self.containers_db:
+                del self.containers_db[container_name]
+            
+            logger.info(f"Container {container_name} deleted")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to delete container: {e.stderr}")
+            return False
+    
+    async def cleanup_expired_containers(self):
+        """Clean up expired containers"""
+        current_time = datetime.now()
+        expired_containers = []
+        
+        for name, info in self.containers_db.items():
+            expiration_time = datetime.fromisoformat(info["expires_at"])
+            if current_time >= expiration_time:
+                expired_containers.append(name)
+        
+        for container_name in expired_containers:
+            logger.info(f"Freezing expired container: {container_name}")
+            await self.freeze_container(container_name)
+            
+        return len(expired_containers)
