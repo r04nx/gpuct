@@ -10,3 +10,8 @@ dist/
 build/
 *.part
 *.log
+target/
+*.tar.gz
+*.jar
+bin/godot4
+assets/downloaded/*.zip
